@@ -21,8 +21,10 @@ API_URL = os.getenv("O1_API_URL", "").strip()
 CHAIN_ID = os.getenv("O1_CHAIN_ID", "8453").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "30")))
 STATE_FILE = Path(os.getenv("STATE_FILE", "seen_tokens.json"))
+INITIAL_SCAN = os.getenv("INITIAL_SCAN", "mark_seen").lower()
 
 
 def require_config() -> None:
@@ -104,9 +106,9 @@ def fetch_tokens(session: requests.Session) -> list[dict[str, Any]]:
 def send_telegram(session: requests.Session, token: dict[str, Any]) -> None:
     message = f"🚀 New token on o1 Launchpad\n<b>{token_name(token)}</b>\n{token_link(token)}"
     response = session.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}/sendMessage",
         data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False},
-        timeout=20,
+        timeout=(10, 60),
     )
     response.raise_for_status()
 
@@ -120,14 +122,24 @@ def main() -> None:
     while True:
         try:
             tokens = fetch_tokens(session)
+            if not seen and INITIAL_SCAN == "mark_seen":
+                seen.update(token_id(token) for token in tokens)
+                save_seen(seen)
+                log.info("Initial scan complete: marked %s existing tokens", len(tokens))
+                time.sleep(POLL_SECONDS)
+                continue
             fresh = [token for token in tokens if token_id(token) not in seen]
             for token in reversed(fresh):
-                send_telegram(session, token)
+                try:
+                    send_telegram(session, token)
+                except requests.RequestException as exc:
+                    log.warning("Telegram send failed for %s: %s", token_name(token), exc)
+                    break
                 seen.add(token_id(token))
                 save_seen(seen)
                 log.info("Sent %s", token_name(token))
         except (requests.RequestException, ValueError, OSError) as exc:
-            log.warning("Polling failed: %s", exc)
+            log.warning("o1 polling failed: %s", exc)
         time.sleep(POLL_SECONDS)
 
 

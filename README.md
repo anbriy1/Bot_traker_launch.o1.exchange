@@ -14,7 +14,8 @@ notepad .env
 
 3. Create a Telegram bot with [@BotFather](https://t.me/BotFather), add it to the target chat/channel, and fill in `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 4. Fill in `O1_API_KEY` with a newly issued key. Use `https://api.launch.o1.exchange/v1/tokens` for `O1_API_URL` and `8453` for `O1_CHAIN_ID` (Base).
-5. Start it:
+5. In Railway Variables, set `INITIAL_SCAN=mark_seen` so the first deployment does not send all existing tokens. Set `TELEGRAM_API_BASE` to a reachable Telegram Bot API proxy only if Railway cannot reach `api.telegram.org`.
+6. Start it:
 
 ```powershell
 .\.venv\Scripts\python.exe bot.py
