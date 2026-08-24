@@ -25,6 +25,7 @@ TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "https://api.telegram.org").r
 POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "30")))
 STATE_FILE = Path(os.getenv("STATE_FILE", "seen_tokens.json"))
 INITIAL_SCAN = os.getenv("INITIAL_SCAN", "mark_seen").lower()
+TEST_MESSAGE_ON_START = os.getenv("TEST_MESSAGE_ON_START", "false").lower() == "true"
 
 
 def require_config() -> None:
@@ -110,7 +111,26 @@ def send_telegram(session: requests.Session, token: dict[str, Any]) -> None:
         data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False},
         timeout=(10, 60),
     )
-    response.raise_for_status()
+    if not response.ok:
+        try:
+            details = response.json().get("description", response.text)
+        except ValueError:
+            details = response.text
+        raise requests.HTTPError(f"{response.status_code}: {details}", response=response)
+
+
+def send_test_message(session: requests.Session) -> None:
+    response = session.post(
+        f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": "o1 Launch бот подключен и работает."},
+        timeout=(10, 60),
+    )
+    if not response.ok:
+        try:
+            details = response.json().get("description", response.text)
+        except ValueError:
+            details = response.text
+        raise requests.HTTPError(f"{response.status_code}: {details}", response=response)
 
 
 def main() -> None:
@@ -118,6 +138,12 @@ def main() -> None:
     seen = load_seen()
     session = requests.Session()
     log.info("Watching %s every %ss", API_URL, POLL_SECONDS)
+    if TEST_MESSAGE_ON_START:
+        try:
+            send_test_message(session)
+            log.info("Telegram test message sent")
+        except requests.RequestException as exc:
+            log.error("Telegram test failed: %s", exc)
 
     while True:
         try:
