@@ -147,6 +147,34 @@ class FlowTests(unittest.TestCase):
         assert record is not None
         self.assertTrue(record.growth_alert_sent)
 
+    def test_startup_message_sent_to_both_chats(self) -> None:
+        cfg = settings(database_path=self.db, telegram_chat_id="new-chat", telegram_growth_chat_id="growth-chat")
+
+        class FakeResponse:
+            ok = True
+            text = "ok"
+
+            @staticmethod
+            def json():
+                return {}
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+
+            def post(self, url: str, data: dict, timeout):
+                self.calls.append({"url": url, "data": data, "timeout": timeout})
+                return FakeResponse()
+
+        session = FakeSession()
+        notifier = TelegramNotifier(cfg, session=session)
+
+        notifier.send_test_message()
+
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual([call["data"]["chat_id"] for call in session.calls], ["new-chat", "growth-chat"])
+        self.assertEqual(session.calls[0]["data"]["text"], "o1 Launch bot connected and working.")
+
     def test_growth_claim_is_idempotent(self) -> None:
         self.scanner.process_list([sample_token(2800)])
         hits = []

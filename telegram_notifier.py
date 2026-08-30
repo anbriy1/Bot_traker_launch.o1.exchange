@@ -19,7 +19,10 @@ class TelegramNotifier:
         self._lock = threading.Lock()
 
     def send_test_message(self) -> None:
-        self._post(self.settings.telegram_chat_id, "o1 Launch бот подключен и работает.")
+        message = "o1 Launch bot connected and working."
+        self._post(self.settings.telegram_chat_id, message)
+        if self.settings.telegram_growth_chat_id != self.settings.telegram_chat_id:
+            self._post(self.settings.telegram_growth_chat_id, message)
 
     def send_new_token(
         self,
