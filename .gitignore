@@ -1,4 +1,8 @@
 .env
 seen_tokens.json
+tokens.db
+tokens.db-wal
+tokens.db-shm
 __pycache__/
 *.pyc
+.venv/

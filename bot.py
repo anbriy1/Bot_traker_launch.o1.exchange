@@ -1,172 +1,91 @@
-import json
+from __future__ import annotations
+
 import logging
-import os
+import threading
 import time
-from pathlib import Path
-from typing import Any
 
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+from config import load_settings, require_config
+from o1_client import O1ApiError, O1Client
+from repository import TokenRepository
+from scanner import Scanner
+from telegram_notifier import TelegramNotifier
+from tracker import Tracker
+
+settings = load_settings()
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=settings.log_level,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("o1-launch-alerts")
 
-API_KEY = os.getenv("O1_API_KEY", "").strip()
-API_URL = os.getenv("O1_API_URL", "").strip()
-CHAIN_ID = os.getenv("O1_CHAIN_ID", "8453").strip()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
-POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "30")))
-STATE_FILE = Path(os.getenv("STATE_FILE", "seen_tokens.json"))
-INITIAL_SCAN = os.getenv("INITIAL_SCAN", "mark_seen").lower()
-TEST_MESSAGE_ON_START = os.getenv("TEST_MESSAGE_ON_START", "false").lower() == "true"
 
-
-def require_config() -> None:
-    missing = [
-        name for name, value in {
-            "O1_API_KEY": API_KEY,
-            "O1_API_URL": API_URL,
-            "TELEGRAM_BOT_TOKEN": TELEGRAM_TOKEN,
-            "TELEGRAM_CHAT_ID": CHAT_ID,
-        }.items()
-        if not value
-    ]
-    if missing:
-        raise SystemExit("Missing .env values: " + ", ".join(missing))
-
-
-def load_seen() -> set[str]:
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return set(data if isinstance(data, list) else [])
-    except FileNotFoundError:
-        return set()
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Cannot read state file: %s", exc)
-        return set()
-
-
-def save_seen(seen: set[str]) -> None:
-    STATE_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=True, indent=2), encoding="utf-8")
-
-
-def token_list(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
-        for key in ("tokens", "data", "results", "items"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
-    raise ValueError("API response does not contain a token list")
-
-
-def token_id(token: dict[str, Any]) -> str:
-    token_data = token.get("token") if isinstance(token.get("token"), dict) else token
-    for key in ("id", "address", "contractAddress", "tokenAddress", "slug"):
-        value = token_data.get(key)
-        if value:
-            return str(value)
-    return json.dumps(token, sort_keys=True)
-
-
-def token_name(token: dict[str, Any]) -> str:
-    token_data = token.get("token") if isinstance(token.get("token"), dict) else token
-    name = token_data.get("name") or token_data.get("symbol") or "New token"
-    symbol = token_data.get("symbol")
-    return f"{name} ({symbol})" if symbol and str(symbol) not in str(name) else str(name)
-
-
-def token_link(token: dict[str, Any]) -> str:
-    for key in ("url", "link", "tokenUrl"):
-        if token.get(key):
-            return str(token[key])
-    token_data = token.get("token") if isinstance(token.get("token"), dict) else token
-    identifier = token_data.get("address") or token_data.get("contractAddress") or token_data.get("slug") or token_id(token)
-    return f"https://launch.o1.exchange/token/{identifier}"
-
-
-def fetch_tokens(session: requests.Session) -> list[dict[str, Any]]:
-    response = session.get(
-        API_URL,
-        headers={"Authorization": f"Bearer {API_KEY}", "X-API-Key": API_KEY, "Accept": "application/json"},
-        params={"chain_id": CHAIN_ID},
-        timeout=20,
-    )
-    response.raise_for_status()
-    return token_list(response.json())
-
-
-def send_telegram(session: requests.Session, token: dict[str, Any]) -> None:
-    message = f"🚀 New token on o1 Launchpad\n<b>{token_name(token)}</b>\n{token_link(token)}"
-    response = session.post(
-        f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False},
-        timeout=(10, 60),
-    )
-    if not response.ok:
+def scanner_loop(scanner: Scanner, client: O1Client, stop: threading.Event) -> None:
+    while not stop.is_set():
         try:
-            details = response.json().get("description", response.text)
-        except ValueError:
-            details = response.text
-        raise requests.HTTPError(f"{response.status_code}: {details}", response=response)
+            tokens = client.fetch_tokens()
+            scanner.process_list(tokens)
+        except (O1ApiError, requests.RequestException, ValueError, OSError) as exc:
+            log.warning("[SCANNER] o1 polling failed: %s", exc)
+        stop.wait(settings.poll_seconds)
 
 
-def send_test_message(session: requests.Session) -> None:
-    response = session.post(
-        f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": "o1 Launch бот подключен и работает."},
-        timeout=(10, 60),
-    )
-    if not response.ok:
+def tracker_loop(tracker: Tracker, client: O1Client, stop: threading.Event) -> None:
+    while not stop.is_set():
         try:
-            details = response.json().get("description", response.text)
-        except ValueError:
-            details = response.text
-        raise requests.HTTPError(f"{response.status_code}: {details}", response=response)
+            listed = []
+            try:
+                listed = client.fetch_tokens()
+            except (O1ApiError, requests.RequestException, ValueError) as exc:
+                log.warning("[TRACKER] list refresh failed: %s", exc)
+            tracker.run_once(listed)
+        except (O1ApiError, requests.RequestException, ValueError, OSError) as exc:
+            log.warning("[TRACKER] cycle failed: %s", exc)
+        stop.wait(settings.track_interval_seconds)
 
 
 def main() -> None:
-    require_config()
-    seen = load_seen()
-    session = requests.Session()
-    log.info("Watching %s every %ss", API_URL, POLL_SECONDS)
-    if TEST_MESSAGE_ON_START:
+    require_config(settings)
+    repo = TokenRepository(settings.database_path)
+    imported = repo.migrate_seen_json(settings.state_file)
+    if imported:
+        log.info("[SCANNER] Migrated %s ids from %s", imported, settings.state_file)
+    client = O1Client(settings.api_url, settings.api_key, settings.chain_id, settings.list_limit)
+    notifier = TelegramNotifier(settings, client.session)
+    scanner = Scanner(settings, repo, notifier)
+    tracker = Tracker(settings, repo, client, notifier)
+
+    log.info("Watching %s every %ss; track every %ss", settings.api_url, settings.poll_seconds, settings.track_interval_seconds)
+    if settings.telegram_growth_chat_id != settings.telegram_chat_id:
+        log.info("NEW alerts -> chat %s; GROWTH alerts -> chat %s", settings.telegram_chat_id, settings.telegram_growth_chat_id)
+    else:
+        log.warning("TELEGRAM_GROWTH_CHAT_ID is unset; growth alerts use TELEGRAM_CHAT_ID")
+
+    if settings.test_message_on_start:
         try:
-            send_test_message(session)
+            notifier.send_test_message()
             log.info("Telegram test message sent")
         except requests.RequestException as exc:
             log.error("Telegram test failed: %s", exc)
 
-    while True:
-        try:
-            tokens = fetch_tokens(session)
-            if not seen and INITIAL_SCAN == "mark_seen":
-                seen.update(token_id(token) for token in tokens)
-                save_seen(seen)
-                log.info("Initial scan complete: marked %s existing tokens", len(tokens))
-                time.sleep(POLL_SECONDS)
-                continue
-            fresh = [token for token in tokens if token_id(token) not in seen]
-            for token in reversed(fresh):
-                try:
-                    send_telegram(session, token)
-                except requests.RequestException as exc:
-                    log.warning("Telegram send failed for %s: %s", token_name(token), exc)
-                    break
-                seen.add(token_id(token))
-                save_seen(seen)
-                log.info("Sent %s", token_name(token))
-        except (requests.RequestException, ValueError, OSError) as exc:
-            log.warning("o1 polling failed: %s", exc)
-        time.sleep(POLL_SECONDS)
+    stop = threading.Event()
+    workers = [
+        threading.Thread(target=scanner_loop, args=(scanner, client, stop), name="scanner", daemon=True),
+        threading.Thread(target=tracker_loop, args=(tracker, client, stop), name="tracker", daemon=True),
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Shutting down")
+        stop.set()
+        for worker in workers:
+            worker.join(timeout=5)
+        repo.close()
 
 
 if __name__ == "__main__":
